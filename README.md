@@ -2,8 +2,6 @@
 
 Mechanistic interpretability framework for custom transformer architectures. End-to-end pipeline from trained model to attribution graphs on Neuronpedia.
 
-Built for [SplitLlama](interp/models/split_llama.py) -- a hybrid architecture combining early 8B LLaMA layers with late 70B LLaMA layers via a trainable adapter -- but designed to work with any model using standard `LlamaDecoderLayer` blocks.
-
 ## Pipeline
 
 ```
@@ -45,7 +43,7 @@ Train sparse autoencoders on residual stream activations:
 
 ```bash
 interp-train-saes \
-    --model_path /path/to/split_llama_config \
+    --model_path /path/to/model_config \
     --dataset_name togethercomputer/RedPajama-Data-1T-Sample \
     --hook_names layers_first.0.resid_post layers_last.0.resid_post \
     --expansion_factor 32 \
@@ -61,7 +59,7 @@ Train skip transcoders that replace MLP layers with sparse, interpretable approx
 
 ```bash
 interp-train-transcoders \
-    --model_path /path/to/split_llama_config \
+    --model_path /path/to/model_config \
     --dataset_name togethercomputer/RedPajama-Data-1T-Sample \
     --train_all \
     --expansion_factor 32 \
@@ -77,7 +75,7 @@ Trace circuits through the model for a given prompt:
 
 ```bash
 interp-trace \
-    --model_path /path/to/split_llama_config \
+    --model_path /path/to/model_config \
     --transcoder_dir ./checkpoints/transcoders \
     --prompt "The capital of France is" \
     --output_dir ./graphs
@@ -122,7 +120,7 @@ pruned.save("graph.json")
 
 ```
 interp/
-├── models/          SplitLlama model definition
+├── models/          Model definitions
 ├── wrapper/         nnsight hooks + activation caching
 ├── training/        SAE and Transcoder models + trainers
 ├── circuits/        Replacement model, attribution, graph pruning
@@ -130,14 +128,6 @@ interp/
 ├── eval/            Reconstruction, sparsity, fidelity metrics
 └── scripts/         CLI entry points
 ```
-
-### SplitLlama-Specific Design
-
-The framework handles the split architecture's unique properties:
-
-- **Two hidden dimensions**: SAEs/transcoders automatically configured with correct `d_in` per layer group (8B vs 70B)
-- **Adapter bridge**: Attribution edges trace through the linear adapter for cross-group feature interactions
-- **Standard LlamaDecoderLayer**: All hooks work via nnsight with zero reimplementation
 
 ### Hook Points
 
