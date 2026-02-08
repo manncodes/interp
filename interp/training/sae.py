@@ -30,20 +30,23 @@ logger = logging.getLogger(__name__)
 # Distributed helpers
 # ---------------------------------------------------------------------------
 
-def setup_distributed():
+def setup_distributed() -> tuple[int, int, int]:
     """
     Initialize the PyTorch distributed process group for DDP training.
 
     Should be called at the start of each worker process launched by torchrun.
     Uses the NCCL backend for GPU communication and reads LOCAL_RANK from the
     environment to set the correct CUDA device.
-    """
-    if dist.is_initialized():
-        return
 
-    dist.init_process_group(backend="nccl")
+    Returns:
+        (rank, local_rank, world_size)
+    """
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
+
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
+    return dist.get_rank(), local_rank, dist.get_world_size()
 
 
 def cleanup_distributed():
