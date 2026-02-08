@@ -87,10 +87,12 @@ def parse_args():
     p.add_argument("--model_path", type=str, default="", help="Path to SplitLlama config dir")
     p.add_argument("--device", type=str, default="cuda")
 
-    # Data source (either model+dataset or cached activations)
-    p.add_argument("--dataset_name", type=str, default="")
+    # Data source (pick one: model+dataset, model+tokenized_dir, or cache_dir)
+    p.add_argument("--dataset_name", type=str, default="", help="HuggingFace dataset name or local path")
     p.add_argument("--dataset_split", type=str, default="train")
     p.add_argument("--text_column", type=str, default="text")
+    p.add_argument("--tokenized_dir", type=str, default="", help="Path to dir with train.bin (pre-tokenized)")
+    p.add_argument("--token_dtype", type=str, default="uint16", help="Dtype of token IDs in .bin file (uint16, int32)")
     p.add_argument("--cache_dir", type=str, default="", help="Load from cached activations")
     p.add_argument("--context_len", type=int, default=1024)
 
@@ -149,12 +151,12 @@ def main():
     try:
         if args.cache_dir:
             _train_from_cache(args)
-        elif args.model_path and args.dataset_name:
+        elif args.model_path and (args.dataset_name or args.tokenized_dir):
             _train_from_model(args)
         else:
             raise ValueError(
-                "Provide either --cache_dir (cached activations) or "
-                "both --model_path and --dataset_name"
+                "Provide either --cache_dir, or --model_path with "
+                "--dataset_name or --tokenized_dir"
             )
     finally:
         if distributed:
@@ -222,11 +224,52 @@ def _train_from_cache(args):
         trainer.train(make_loader())
 
 
-def _train_from_model(args):
-    """Train SAEs by extracting activations on-the-fly from the model."""
+def _build_token_iter(args):
+    """Build a token ID iterator from either --tokenized_dir or --dataset_name."""
+    if args.tokenized_dir:
+        from interp.training.data import tokenized_bin_iter
+
+        logger.info("Using pre-tokenized data from: %s", args.tokenized_dir)
+        return lambda: tokenized_bin_iter(
+            args.tokenized_dir,
+            context_len=args.context_len,
+            token_dtype=args.token_dtype,
+            seed=args.seed,
+        )
+
     from datasets import load_dataset
     from transformers import AutoTokenizer
 
+    logger.info("Loading dataset: %s (split=%s, streaming=True)", args.dataset_name, args.dataset_split)
+    t0 = time.time()
+    dataset = load_dataset(args.dataset_name, split=args.dataset_split, streaming=True)
+    logger.info("Dataset loaded in %.1fs", time.time() - t0)
+
+    logger.info("Loading tokenizer from model config...")
+    with open(os.path.join(args.model_path, "config.json")) as f:
+        model_cfg = json.load(f)
+    tokenizer = AutoTokenizer.from_pretrained(model_cfg["path8b"])
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    logger.info("Tokenizer loaded: %s (vocab_size=%d)", type(tokenizer).__name__, tokenizer.vocab_size)
+
+    def tokenize_iter():
+        for example in dataset:
+            text = example[args.text_column]
+            encoded = tokenizer(
+                text,
+                max_length=args.context_len,
+                truncation=True,
+                padding="max_length",
+                return_tensors="pt",
+            )
+            yield encoded["input_ids"].squeeze(0)
+
+    return tokenize_iter
+
+
+def _train_from_model(args):
+    """Train SAEs by extracting activations on-the-fly from the model."""
     # Load model
     logger.info("Loading model from: %s", args.model_path)
     t0 = time.time()
@@ -247,33 +290,8 @@ def _train_from_model(args):
         logger.info("--train_all_resid: resolved to %d hooks", len(hook_names))
     logger.info("Hooks to train: %s", hook_names)
 
-    # Load dataset
-    logger.info("Loading dataset: %s (split=%s, streaming=True)", args.dataset_name, args.dataset_split)
-    t0 = time.time()
-    dataset = load_dataset(args.dataset_name, split=args.dataset_split, streaming=True)
-    logger.info("Dataset loaded in %.1fs", time.time() - t0)
-
-    # Detect tokenizer from model path
-    logger.info("Loading tokenizer from model config...")
-    with open(os.path.join(args.model_path, "config.json")) as f:
-        model_cfg = json.load(f)
-    tokenizer = AutoTokenizer.from_pretrained(model_cfg["path8b"])
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    logger.info("Tokenizer loaded: %s (vocab_size=%d)", type(tokenizer).__name__, tokenizer.vocab_size)
-
-    # Tokenize dataset
-    def tokenize_iter():
-        for example in dataset:
-            text = example[args.text_column]
-            encoded = tokenizer(
-                text,
-                max_length=args.context_len,
-                truncation=True,
-                padding="max_length",
-                return_tensors="pt",
-            )
-            yield encoded["input_ids"].squeeze(0)
+    # Build token iterator (from bin file or HF dataset)
+    make_token_iter = _build_token_iter(args)
 
     # Train SAE for each hook
     for i, hook_name in enumerate(hook_names):
@@ -312,10 +330,8 @@ def _train_from_model(args):
         store = ActivationStore(hooked, hook_names=[hook_name], context_len=args.context_len)
 
         def make_activation_iter():
-            for act_dict in store.stream(tokenize_iter(), batch_size=32):
-                # act_dict[hook_name] is (B*T, d_in)
+            for act_dict in store.stream(make_token_iter(), batch_size=32):
                 acts = act_dict[hook_name]
-                # Split into training-batch-sized chunks
                 for i in range(0, acts.shape[0], args.batch_size):
                     yield acts[i : i + args.batch_size]
 
