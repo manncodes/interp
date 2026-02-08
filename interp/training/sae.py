@@ -8,7 +8,9 @@ Includes dead feature resampling and decoder normalization.
 from __future__ import annotations
 
 import json
+import logging
 import os
+import time
 from pathlib import Path
 
 import torch
@@ -18,6 +20,8 @@ from safetensors.torch import load_file, save_file
 from tqdm import tqdm
 
 from interp.training.config import SAEConfig, TrainingConfig
+
+logger = logging.getLogger(__name__)
 
 
 class SparseAutoencoder(nn.Module):
@@ -192,6 +196,24 @@ class SparseAutoencoder(nn.Module):
         return sae
 
 
+def _format_time(seconds: float) -> str:
+    """Format seconds into a human-readable string (e.g. 1h 23m 45s)."""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes = int(seconds // 60)
+    secs = int(seconds % 60)
+    if minutes < 60:
+        return f"{minutes}m {secs:02d}s"
+    hours = int(minutes // 60)
+    mins = minutes % 60
+    return f"{hours}h {mins:02d}m {secs:02d}s"
+
+
+def _count_parameters(model: nn.Module) -> int:
+    """Count total trainable parameters in a model."""
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
 class SAETrainer:
     """Training loop for sparse autoencoders."""
 
@@ -235,6 +257,115 @@ class SAETrainer:
             return self._tokens_seen / max(self.cfg.warmup_tokens, 1)
         return 1.0
 
+    def _log_startup_info(self):
+        """Log full configuration and model summary at training start."""
+        sae_cfg = self.sae.cfg
+        train_cfg = self.cfg
+        param_count = _count_parameters(self.sae)
+
+        logger.info("=" * 70)
+        logger.info("SAE TRAINING -- STARTUP")
+        logger.info("=" * 70)
+        logger.info("Model configuration:")
+        logger.info("  d_in:              %d", sae_cfg.d_in)
+        logger.info("  d_sae:             %d", sae_cfg.d_sae)
+        logger.info("  expansion_factor:  %d", sae_cfg.expansion_factor)
+        logger.info("  activation_fn:     %s", sae_cfg.activation_fn)
+        if sae_cfg.activation_fn == "topk":
+            logger.info("  k:                 %d", sae_cfg.k)
+        elif sae_cfg.activation_fn == "jumprelu":
+            logger.info("  jumprelu_thresh:   %.4f", sae_cfg.jumprelu_threshold)
+        logger.info("  normalize_decoder: %s", sae_cfg.normalize_decoder)
+        logger.info("  tied_init:         %s", sae_cfg.tied_init)
+        logger.info("  trainable params:  %s", f"{param_count:,}")
+        logger.info("Training configuration:")
+        logger.info("  device:            %s", self.device)
+        logger.info("  dtype:             %s", train_cfg.dtype)
+        logger.info("  lr:                %.2e", train_cfg.lr)
+        logger.info("  weight_decay:      %.2e", train_cfg.weight_decay)
+        logger.info("  batch_size:        %d", train_cfg.batch_size)
+        logger.info("  total_tokens:      %s", f"{train_cfg.total_tokens:,}")
+        logger.info("  warmup_tokens:     %s", f"{train_cfg.warmup_tokens:,}")
+        logger.info("  log_every:         %d steps", train_cfg.log_every)
+        logger.info("  checkpoint_every:  %s tokens", f"{train_cfg.checkpoint_every:,}")
+        logger.info("  checkpoint_dir:    %s", train_cfg.checkpoint_dir or "(none)")
+        logger.info("  resample_dead:     %s (every %d steps)", train_cfg.resample_dead, train_cfg.resample_every)
+        logger.info("  wandb_project:     %s", train_cfg.wandb_project or "(disabled)")
+        if torch.cuda.is_available():
+            logger.info("  GPU:               %s", torch.cuda.get_device_name(0))
+            gpu_mem = torch.cuda.get_device_properties(0).total_mem / (1024 ** 3)
+            logger.info("  GPU memory:        %.1f GB", gpu_mem)
+        logger.info("=" * 70)
+
+    def _log_periodic_summary(
+        self,
+        loss: float,
+        recon_loss: float,
+        cosine_sim: float,
+        variance_explained: float,
+        l0: float,
+        n_dead: int,
+        lr_mult: float,
+        elapsed: float,
+    ):
+        """Log a rich summary block every N steps."""
+        throughput = self._tokens_seen / max(elapsed, 1e-9)
+        dead_pct = 100.0 * n_dead / self.sae.cfg.d_sae
+
+        logger.info("-" * 60)
+        logger.info(
+            "Step %-8d | Tokens: %s / %s (%.1f%%)",
+            self._step,
+            f"{self._tokens_seen:,}",
+            f"{self.cfg.total_tokens:,}",
+            100.0 * self._tokens_seen / max(self.cfg.total_tokens, 1),
+        )
+        logger.info(
+            "  loss:          %.6f  |  recon_loss:     %.6f",
+            loss,
+            recon_loss,
+        )
+        logger.info(
+            "  cosine_sim:    %.6f  |  var_explained:  %.6f",
+            cosine_sim,
+            variance_explained,
+        )
+        logger.info(
+            "  L0 sparsity:   %.2f   |  dead features:  %d / %d (%.2f%%)",
+            l0,
+            n_dead,
+            self.sae.cfg.d_sae,
+            dead_pct,
+        )
+        logger.info(
+            "  lr:            %.2e  |  throughput:     %.0f tok/s",
+            self.cfg.lr * lr_mult,
+            throughput,
+        )
+        logger.info(
+            "  elapsed:       %s",
+            _format_time(elapsed),
+        )
+        logger.info("-" * 60)
+
+    def _log_final_summary(self, elapsed: float):
+        """Log summary at the end of training."""
+        throughput = self._tokens_seen / max(elapsed, 1e-9)
+        n_dead = self.sae.dead_features.sum().item()
+        dead_pct = 100.0 * n_dead / self.sae.cfg.d_sae
+
+        logger.info("=" * 70)
+        logger.info("SAE TRAINING -- COMPLETE")
+        logger.info("=" * 70)
+        logger.info("  total steps:       %d", self._step)
+        logger.info("  total tokens:      %s", f"{self._tokens_seen:,}")
+        logger.info("  wall time:         %s", _format_time(elapsed))
+        logger.info("  avg throughput:    %.0f tok/s", throughput)
+        logger.info("  final dead feats:  %d / %d (%.2f%%)", n_dead, self.sae.cfg.d_sae, dead_pct)
+        if self.cfg.checkpoint_dir:
+            logger.info("  final checkpoint:  %s", os.path.join(self.cfg.checkpoint_dir, "sae_final"))
+        logger.info("=" * 70)
+
     def train(self, activation_iter):
         """
         Train the SAE on an iterator of activation batches.
@@ -245,9 +376,19 @@ class SAETrainer:
                 ActivationStore.get_cached_loader().
         """
         self._init_wandb()
+        self._log_startup_info()
         self.sae.train()
 
-        pbar = tqdm(total=self.cfg.total_tokens, desc="Training SAE", unit="tok")
+        train_start = time.time()
+        last_log_time = train_start
+
+        pbar = tqdm(
+            total=self.cfg.total_tokens,
+            desc="Training SAE",
+            unit="tok",
+            unit_scale=True,
+            smoothing=0.05,
+        )
 
         for batch in activation_iter:
             if self._tokens_seen >= self.cfg.total_tokens:
@@ -279,20 +420,32 @@ class SAETrainer:
 
             # Logging
             if self._step % self.cfg.log_every == 0:
+                now = time.time()
+                elapsed = now - train_start
+
                 with torch.no_grad():
                     l0 = (h > 0).float().sum(dim=-1).mean().item()
                     recon_loss = F.mse_loss(x_hat, batch).item()
                     cosine_sim = F.cosine_similarity(x_hat, batch, dim=-1).mean().item()
                     n_dead = self.sae.dead_features.sum().item()
 
+                    # Variance explained: 1 - Var(x - x_hat) / Var(x)
+                    residual_var = (batch - x_hat).var().item()
+                    input_var = batch.var().item()
+                    variance_explained = 1.0 - residual_var / max(input_var, 1e-12)
+
+                throughput = self._tokens_seen / max(elapsed, 1e-9)
+
                 metrics = {
                     "loss": loss.item(),
                     "recon_loss": recon_loss,
                     "l0": l0,
                     "cosine_sim": cosine_sim,
+                    "variance_explained": variance_explained,
                     "dead_features": n_dead,
                     "lr": self.cfg.lr * lr_mult,
                     "tokens_seen": self._tokens_seen,
+                    "throughput_tok_s": throughput,
                 }
 
                 if self._wandb_run:
@@ -304,7 +457,21 @@ class SAETrainer:
                     l0=f"{l0:.1f}",
                     cos=f"{cosine_sim:.4f}",
                     dead=n_dead,
+                    tok_s=f"{throughput:.0f}",
                 )
+
+                # Rich periodic summary (log every log_every steps via logger)
+                self._log_periodic_summary(
+                    loss=loss.item(),
+                    recon_loss=recon_loss,
+                    cosine_sim=cosine_sim,
+                    variance_explained=variance_explained,
+                    l0=l0,
+                    n_dead=n_dead,
+                    lr_mult=lr_mult,
+                    elapsed=elapsed,
+                )
+                last_log_time = now
 
             # Resample dead features
             if (
@@ -314,8 +481,20 @@ class SAETrainer:
             ):
                 n_resampled = self.sae.resample_dead_features(batch)
                 if n_resampled > 0:
+                    logger.info(
+                        "[step %d] Resampled %d dead features (%.2f%% of d_sae=%d)",
+                        self._step,
+                        n_resampled,
+                        100.0 * n_resampled / self.sae.cfg.d_sae,
+                        self.sae.cfg.d_sae,
+                    )
                     self.sae.feature_act_count.zero_()
                     self.sae.total_batches.zero_()
+                else:
+                    logger.info(
+                        "[step %d] Dead feature resampling check: 0 dead features found, nothing to resample",
+                        self._step,
+                    )
 
             # Checkpoint
             if (
@@ -327,12 +506,23 @@ class SAETrainer:
                     f"sae_step{self._step}",
                 )
                 self.sae.save(ckpt_path)
+                logger.info(
+                    "[step %d] Checkpoint saved to: %s",
+                    self._step,
+                    ckpt_path,
+                )
 
         pbar.close()
 
+        total_elapsed = time.time() - train_start
+
         # Final save
         if self.cfg.checkpoint_dir:
-            self.sae.save(os.path.join(self.cfg.checkpoint_dir, "sae_final"))
+            final_path = os.path.join(self.cfg.checkpoint_dir, "sae_final")
+            self.sae.save(final_path)
+            logger.info("Final model saved to: %s", final_path)
+
+        self._log_final_summary(total_elapsed)
 
         if self._wandb_run:
             import wandb

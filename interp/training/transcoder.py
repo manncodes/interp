@@ -13,7 +13,9 @@ Supports:
 from __future__ import annotations
 
 import json
+import logging
 import os
+import time
 from pathlib import Path
 
 import torch
@@ -23,6 +25,8 @@ from safetensors.torch import load_file, save_file
 from tqdm import tqdm
 
 from interp.training.config import TranscoderConfig, TrainingConfig
+
+logger = logging.getLogger(__name__)
 
 
 class Transcoder(nn.Module):
@@ -183,6 +187,33 @@ class Transcoder(nn.Module):
         return tc
 
 
+def _count_parameters(model: nn.Module) -> int:
+    """Return total number of trainable parameters."""
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def _format_tokens(n: int) -> str:
+    """Format a token count into a human-readable string (e.g., 1.5M, 200K)."""
+    if n >= 1_000_000_000:
+        return f"{n / 1_000_000_000:.2f}B"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.2f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    return str(n)
+
+
+def _format_duration(seconds: float) -> str:
+    """Format seconds into h:mm:ss or m:ss."""
+    seconds = int(seconds)
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    if h > 0:
+        return f"{h}h {m:02d}m {s:02d}s"
+    return f"{m}m {s:02d}s"
+
+
 class TranscoderTrainer:
     """Training loop for transcoders."""
 
@@ -225,6 +256,120 @@ class TranscoderTrainer:
             return self._tokens_seen / max(self.cfg.warmup_tokens, 1)
         return 1.0
 
+    def _log_startup_summary(self):
+        """Log a comprehensive summary of the training configuration at startup."""
+        tc_cfg = self.transcoder.cfg
+        tr_cfg = self.cfg
+        param_count = _count_parameters(self.transcoder)
+
+        logger.info("=" * 72)
+        logger.info("TRANSCODER TRAINING -- CONFIGURATION SUMMARY")
+        logger.info("=" * 72)
+
+        # Model architecture
+        logger.info("-- Model Architecture --")
+        logger.info("  d_in:             %d", tc_cfg.d_in)
+        logger.info("  d_out:            %d", tc_cfg.d_out)
+        logger.info("  d_hidden:         %d", tc_cfg.d_hidden)
+        logger.info("  expansion_factor: %d", tc_cfg.expansion_factor)
+        logger.info("  activation_fn:    %s", tc_cfg.activation_fn)
+        if tc_cfg.activation_fn == "topk":
+            logger.info("  k (topk):         %d", tc_cfg.k)
+        elif tc_cfg.activation_fn == "jumprelu":
+            logger.info("  jumprelu_thresh:  %.4f", tc_cfg.jumprelu_threshold)
+        logger.info("  has_skip:         %s", tc_cfg.has_skip)
+        logger.info("  total parameters: %s (%d)", _format_tokens(param_count), param_count)
+
+        # Device info
+        logger.info("-- Device --")
+        logger.info("  device:           %s", self.device)
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(self.device)
+            gpu_mem = torch.cuda.get_device_properties(self.device).total_mem / (1024 ** 3)
+            logger.info("  GPU:              %s (%.1f GB)", gpu_name, gpu_mem)
+        logger.info("  dtype:            %s", tr_cfg.dtype)
+
+        # Training hyperparameters
+        logger.info("-- Training Hyperparameters --")
+        logger.info("  lr:               %.2e", tr_cfg.lr)
+        logger.info("  betas:            (%.3f, %.4f)", tr_cfg.beta1, tr_cfg.beta2)
+        logger.info("  weight_decay:     %.2e", tr_cfg.weight_decay)
+        logger.info("  batch_size:       %d", tr_cfg.batch_size)
+        logger.info("  total_tokens:     %s", _format_tokens(tr_cfg.total_tokens))
+        logger.info("  warmup_tokens:    %s", _format_tokens(tr_cfg.warmup_tokens))
+
+        # Logging and checkpoints
+        logger.info("-- Logging & Checkpoints --")
+        logger.info("  log_every:        %d steps", tr_cfg.log_every)
+        logger.info("  checkpoint_every: %s tokens", _format_tokens(tr_cfg.checkpoint_every))
+        logger.info("  checkpoint_dir:   %s", tr_cfg.checkpoint_dir or "(none)")
+        logger.info("  wandb_project:    %s", tr_cfg.wandb_project or "(disabled)")
+
+        # Dead feature handling
+        logger.info("-- Dead Feature Handling --")
+        logger.info("  resample_dead:    %s", tr_cfg.resample_dead)
+        if tr_cfg.resample_dead:
+            logger.info("  resample_every:   %d steps", tr_cfg.resample_every)
+        logger.info("  dead_feat_window: %d", tr_cfg.dead_feature_window)
+        logger.info("  dead_feat_thresh: %.1e", tr_cfg.dead_feature_threshold)
+
+        logger.info("=" * 72)
+
+    def _log_periodic_summary(
+        self,
+        loss: float,
+        l0: float,
+        cosine_sim: float,
+        n_dead: int,
+        elapsed: float,
+    ):
+        """Log a rich periodic summary block to the logger."""
+        d_hidden = self.transcoder.cfg.d_hidden
+        dead_pct = (n_dead / d_hidden) * 100.0 if d_hidden > 0 else 0.0
+        throughput = self._tokens_seen / elapsed if elapsed > 0 else 0.0
+        current_lr = self.cfg.lr * self._lr_schedule()
+
+        logger.info("-" * 60)
+        logger.info(
+            "Step %d | Tokens: %s / %s (%.1f%%)",
+            self._step,
+            _format_tokens(self._tokens_seen),
+            _format_tokens(self.cfg.total_tokens),
+            (self._tokens_seen / self.cfg.total_tokens) * 100.0,
+        )
+        logger.info("  Reconstruction loss : %.6f", loss)
+        logger.info("  Cosine similarity   : %.4f", cosine_sim)
+        logger.info("  L0 sparsity         : %.2f", l0)
+        logger.info(
+            "  Dead features       : %d / %d (%.1f%%)",
+            n_dead,
+            d_hidden,
+            dead_pct,
+        )
+        logger.info("  Learning rate       : %.2e", current_lr)
+        logger.info(
+            "  Throughput          : %.0f tokens/sec",
+            throughput,
+        )
+        logger.info("  Time elapsed        : %s", _format_duration(elapsed))
+        logger.info("-" * 60)
+
+    def _log_final_summary(self, elapsed: float):
+        """Log a final summary at the end of training."""
+        throughput = self._tokens_seen / elapsed if elapsed > 0 else 0.0
+
+        logger.info("=" * 72)
+        logger.info("TRAINING COMPLETE")
+        logger.info("=" * 72)
+        logger.info("  Total steps:      %d", self._step)
+        logger.info("  Total tokens:     %s (%d)", _format_tokens(self._tokens_seen), self._tokens_seen)
+        logger.info("  Total time:       %s", _format_duration(elapsed))
+        logger.info("  Avg throughput:   %.0f tokens/sec", throughput)
+        if self.cfg.checkpoint_dir:
+            final_path = os.path.join(self.cfg.checkpoint_dir, "transcoder_final")
+            logger.info("  Final checkpoint: %s", final_path)
+        logger.info("=" * 72)
+
     def train(self, paired_activation_iter):
         """
         Train the transcoder on paired (mlp_input, mlp_output) batches.
@@ -234,10 +379,20 @@ class TranscoderTrainer:
                 (mlp_input, mlp_output) tensor tuples.
         """
         self._init_wandb()
+        self._log_startup_summary()
         self.transcoder.train()
 
+        train_start_time = time.time()
+        last_log_time = train_start_time
+
+        logger.info("Starting training loop...")
+
         pbar = tqdm(
-            total=self.cfg.total_tokens, desc="Training Transcoder", unit="tok"
+            total=self.cfg.total_tokens,
+            desc="Training Transcoder",
+            unit="tok",
+            unit_scale=True,
+            smoothing=0.05,
         )
 
         for mlp_in, mlp_out in paired_activation_iter:
@@ -260,7 +415,17 @@ class TranscoderTrainer:
 
             self._step += 1
             self._tokens_seen += batch_tokens
+
+            # Update tqdm with throughput
+            now = time.time()
+            elapsed = now - train_start_time
+            throughput = self._tokens_seen / elapsed if elapsed > 0 else 0.0
+
             pbar.update(batch_tokens)
+            pbar.set_postfix_str(
+                f"loss={loss.item():.4f} | {throughput:.0f} tok/s",
+                refresh=False,
+            )
 
             if self._step % self.cfg.log_every == 0:
                 with torch.no_grad():
@@ -282,12 +447,24 @@ class TranscoderTrainer:
                     import wandb
                     wandb.log(metrics, step=self._step)
 
-                pbar.set_postfix(
-                    loss=f"{loss.item():.4f}",
-                    l0=f"{l0:.1f}",
-                    cos=f"{cosine_sim:.4f}",
-                    dead=n_dead,
+                # Rich tqdm postfix with all key metrics
+                d_hidden = self.transcoder.cfg.d_hidden
+                dead_pct = (n_dead / d_hidden) * 100.0 if d_hidden > 0 else 0.0
+                pbar.set_postfix_str(
+                    f"loss={loss.item():.4f} | L0={l0:.1f} | cos={cosine_sim:.4f} "
+                    f"| dead={n_dead}({dead_pct:.0f}%) | {throughput:.0f} tok/s",
+                    refresh=True,
                 )
+
+                # Periodic rich summary log
+                self._log_periodic_summary(
+                    loss=loss.item(),
+                    l0=l0,
+                    cosine_sim=cosine_sim,
+                    n_dead=n_dead,
+                    elapsed=elapsed,
+                )
+                last_log_time = now
 
             if (
                 self.cfg.resample_dead
@@ -296,8 +473,20 @@ class TranscoderTrainer:
             ):
                 n_resampled = self.transcoder.resample_dead_features(mlp_in, mlp_out)
                 if n_resampled > 0:
+                    logger.info(
+                        "Resampled %d dead features at step %d (%.1f%% of %d total features)",
+                        n_resampled,
+                        self._step,
+                        (n_resampled / self.transcoder.cfg.d_hidden) * 100.0,
+                        self.transcoder.cfg.d_hidden,
+                    )
                     self.transcoder.feature_act_count.zero_()
                     self.transcoder.total_batches.zero_()
+                else:
+                    logger.info(
+                        "Dead feature resampling triggered at step %d -- no dead features found",
+                        self._step,
+                    )
 
             if (
                 self.cfg.checkpoint_dir
@@ -308,13 +497,23 @@ class TranscoderTrainer:
                     f"transcoder_step{self._step}",
                 )
                 self.transcoder.save(ckpt_path)
+                logger.info(
+                    "Checkpoint saved: %s (step %d, %s tokens)",
+                    ckpt_path,
+                    self._step,
+                    _format_tokens(self._tokens_seen),
+                )
 
         pbar.close()
 
+        total_elapsed = time.time() - train_start_time
+
         if self.cfg.checkpoint_dir:
-            self.transcoder.save(
-                os.path.join(self.cfg.checkpoint_dir, "transcoder_final")
-            )
+            final_path = os.path.join(self.cfg.checkpoint_dir, "transcoder_final")
+            self.transcoder.save(final_path)
+            logger.info("Final checkpoint saved: %s", final_path)
+
+        self._log_final_summary(total_elapsed)
 
         if self._wandb_run:
             import wandb
