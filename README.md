@@ -23,16 +23,16 @@ Custom Transformer
 ## Install
 
 ```bash
-pip install -e .
+uv sync
 
 # with training extras (wandb, bitsandbytes)
-pip install -e ".[train]"
+uv sync --extra train
 
 # with deployment extras (requests)
-pip install -e ".[deploy]"
+uv sync --extra deploy
 
 # everything
-pip install -e ".[all]"
+uv sync --all-extras
 ```
 
 ## Usage
