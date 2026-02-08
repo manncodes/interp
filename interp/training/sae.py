@@ -3,6 +3,7 @@ Sparse Autoencoder model and training loop.
 
 Supports TopK, JumpReLU, and standard ReLU activation functions.
 Includes dead feature resampling and decoder normalization.
+Supports distributed training with PyTorch DDP via torchrun.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import time
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from safetensors.torch import load_file, save_file
@@ -23,6 +25,36 @@ from interp.training.config import SAEConfig, TrainingConfig
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Distributed helpers
+# ---------------------------------------------------------------------------
+
+def setup_distributed():
+    """
+    Initialize the PyTorch distributed process group for DDP training.
+
+    Should be called at the start of each worker process launched by torchrun.
+    Uses the NCCL backend for GPU communication and reads LOCAL_RANK from the
+    environment to set the correct CUDA device.
+    """
+    if dist.is_initialized():
+        return
+
+    dist.init_process_group(backend="nccl")
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+
+
+def cleanup_distributed():
+    """Destroy the distributed process group if one is active."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+# ---------------------------------------------------------------------------
+# SparseAutoencoder model (unchanged)
+# ---------------------------------------------------------------------------
 
 class SparseAutoencoder(nn.Module):
     """
@@ -215,7 +247,14 @@ def _count_parameters(model: nn.Module) -> int:
 
 
 class SAETrainer:
-    """Training loop for sparse autoencoders."""
+    """Training loop for sparse autoencoders.
+
+    Supports single-GPU and multi-GPU (DDP) training. When ``distributed``
+    is True (auto-detected from ``torch.distributed.is_initialized()`` or set
+    explicitly via ``TrainingConfig.distributed``), the SAE is wrapped in
+    ``DistributedDataParallel`` and logging / checkpointing / wandb are gated
+    to rank 0 only.
+    """
 
     def __init__(
         self,
@@ -224,8 +263,39 @@ class SAETrainer:
     ):
         self.sae = sae
         self.cfg = train_cfg
-        self.device = torch.device(train_cfg.device)
+
+        # ---- Distributed detection ----
+        self.distributed: bool = train_cfg.distributed or dist.is_initialized()
+        if self.distributed and not dist.is_initialized():
+            setup_distributed()
+
+        self.rank: int = dist.get_rank() if self.distributed else 0
+        self.local_rank: int = (
+            int(os.environ.get("LOCAL_RANK", 0)) if self.distributed else 0
+        )
+        self.world_size: int = dist.get_world_size() if self.distributed else 1
+        self.is_main: bool = self.rank == 0
+
+        # ---- Device assignment ----
+        if self.distributed:
+            self.device = torch.device(f"cuda:{self.local_rank}")
+        else:
+            self.device = torch.device(train_cfg.device)
+
         self.sae.to(self.device)
+
+        # ---- Wrap model with DDP when distributed ----
+        if self.distributed:
+            self.ddp_sae = nn.parallel.DistributedDataParallel(
+                self.sae,
+                device_ids=[self.local_rank],
+                output_device=self.local_rank,
+            )
+        else:
+            self.ddp_sae = None
+
+        # The module used for the forward pass: DDP wrapper or raw model
+        self._forward_model: nn.Module = self.ddp_sae if self.distributed else self.sae
 
         self.optimizer = torch.optim.Adam(
             self.sae.parameters(),
@@ -238,7 +308,29 @@ class SAETrainer:
         self._tokens_seen = 0
         self._wandb_run = None
 
+    # ------------------------------------------------------------------
+    # Distributed utilities
+    # ------------------------------------------------------------------
+
+    def _sync_loss(self, loss_value: torch.Tensor) -> torch.Tensor:
+        """Average a scalar loss tensor across all ranks.
+
+        Returns the averaged tensor. In non-distributed mode this is a no-op.
+        """
+        if not self.distributed:
+            return loss_value
+        reduced = loss_value.detach().clone()
+        dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
+        reduced /= self.world_size
+        return reduced
+
+    # ------------------------------------------------------------------
+    # Logging helpers (gated behind rank 0 in distributed mode)
+    # ------------------------------------------------------------------
+
     def _init_wandb(self):
+        if not self.is_main:
+            return
         if self.cfg.wandb_project:
             import wandb
 
@@ -259,6 +351,9 @@ class SAETrainer:
 
     def _log_startup_info(self):
         """Log full configuration and model summary at training start."""
+        if not self.is_main:
+            return
+
         sae_cfg = self.sae.cfg
         train_cfg = self.cfg
         param_count = _count_parameters(self.sae)
@@ -291,9 +386,13 @@ class SAETrainer:
         logger.info("  checkpoint_dir:    %s", train_cfg.checkpoint_dir or "(none)")
         logger.info("  resample_dead:     %s (every %d steps)", train_cfg.resample_dead, train_cfg.resample_every)
         logger.info("  wandb_project:     %s", train_cfg.wandb_project or "(disabled)")
+        if self.distributed:
+            logger.info("  distributed:       True (world_size=%d)", self.world_size)
+        else:
+            logger.info("  distributed:       False")
         if torch.cuda.is_available():
-            logger.info("  GPU:               %s", torch.cuda.get_device_name(0))
-            gpu_mem = torch.cuda.get_device_properties(0).total_mem / (1024 ** 3)
+            logger.info("  GPU:               %s", torch.cuda.get_device_name(self.local_rank))
+            gpu_mem = torch.cuda.get_device_properties(self.local_rank).total_mem / (1024 ** 3)
             logger.info("  GPU memory:        %.1f GB", gpu_mem)
         logger.info("=" * 70)
 
@@ -309,6 +408,9 @@ class SAETrainer:
         elapsed: float,
     ):
         """Log a rich summary block every N steps."""
+        if not self.is_main:
+            return
+
         throughput = self._tokens_seen / max(elapsed, 1e-9)
         dead_pct = 100.0 * n_dead / self.sae.cfg.d_sae
 
@@ -350,6 +452,9 @@ class SAETrainer:
 
     def _log_final_summary(self, elapsed: float):
         """Log summary at the end of training."""
+        if not self.is_main:
+            return
+
         throughput = self._tokens_seen / max(elapsed, 1e-9)
         n_dead = self.sae.dead_features.sum().item()
         dead_pct = 100.0 * n_dead / self.sae.cfg.d_sae
@@ -382,13 +487,17 @@ class SAETrainer:
         train_start = time.time()
         last_log_time = train_start
 
-        pbar = tqdm(
-            total=self.cfg.total_tokens,
-            desc="Training SAE",
-            unit="tok",
-            unit_scale=True,
-            smoothing=0.05,
-        )
+        # Only show tqdm progress bar on rank 0
+        if self.is_main:
+            pbar = tqdm(
+                total=self.cfg.total_tokens,
+                desc="Training SAE",
+                unit="tok",
+                unit_scale=True,
+                smoothing=0.05,
+            )
+        else:
+            pbar = None
 
         for batch in activation_iter:
             if self._tokens_seen >= self.cfg.total_tokens:
@@ -402,21 +511,22 @@ class SAETrainer:
             for pg in self.optimizer.param_groups:
                 pg["lr"] = self.cfg.lr * lr_mult
 
-            # Forward
-            x_hat, h, loss = self.sae(batch)
+            # Forward -- use DDP-wrapped model when distributed
+            x_hat, h, loss = self._forward_model(batch)
 
             # Backward
             self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step()
 
-            # Normalize decoder columns
+            # Normalize decoder columns (always on the underlying module)
             if self.sae.cfg.normalize_decoder:
                 self.sae._normalize_decoder()
 
             self._step += 1
             self._tokens_seen += batch_tokens
-            pbar.update(batch_tokens)
+            if pbar is not None:
+                pbar.update(batch_tokens)
 
             # Logging
             if self._step % self.cfg.log_every == 0:
@@ -434,35 +544,43 @@ class SAETrainer:
                     input_var = batch.var().item()
                     variance_explained = 1.0 - residual_var / max(input_var, 1e-12)
 
+                # Sync loss across ranks so the logged value is the global mean
+                if self.distributed:
+                    loss_synced = self._sync_loss(loss)
+                    loss_val = loss_synced.item()
+                else:
+                    loss_val = loss.item()
+
                 throughput = self._tokens_seen / max(elapsed, 1e-9)
 
-                metrics = {
-                    "loss": loss.item(),
-                    "recon_loss": recon_loss,
-                    "l0": l0,
-                    "cosine_sim": cosine_sim,
-                    "variance_explained": variance_explained,
-                    "dead_features": n_dead,
-                    "lr": self.cfg.lr * lr_mult,
-                    "tokens_seen": self._tokens_seen,
-                    "throughput_tok_s": throughput,
-                }
+                if self.is_main:
+                    metrics = {
+                        "loss": loss_val,
+                        "recon_loss": recon_loss,
+                        "l0": l0,
+                        "cosine_sim": cosine_sim,
+                        "variance_explained": variance_explained,
+                        "dead_features": n_dead,
+                        "lr": self.cfg.lr * lr_mult,
+                        "tokens_seen": self._tokens_seen,
+                        "throughput_tok_s": throughput,
+                    }
 
-                if self._wandb_run:
-                    import wandb
-                    wandb.log(metrics, step=self._step)
+                    if self._wandb_run:
+                        import wandb
+                        wandb.log(metrics, step=self._step)
 
-                pbar.set_postfix(
-                    loss=f"{loss.item():.4f}",
-                    l0=f"{l0:.1f}",
-                    cos=f"{cosine_sim:.4f}",
-                    dead=n_dead,
-                    tok_s=f"{throughput:.0f}",
-                )
+                    pbar.set_postfix(
+                        loss=f"{loss_val:.4f}",
+                        l0=f"{l0:.1f}",
+                        cos=f"{cosine_sim:.4f}",
+                        dead=n_dead,
+                        tok_s=f"{throughput:.0f}",
+                    )
 
-                # Rich periodic summary (log every log_every steps via logger)
+                # Rich periodic summary (logger-based, gated behind is_main)
                 self._log_periodic_summary(
-                    loss=loss.item(),
+                    loss=loss_val if self.is_main else loss.item(),
                     recon_loss=recon_loss,
                     cosine_sim=cosine_sim,
                     variance_explained=variance_explained,
@@ -480,47 +598,56 @@ class SAETrainer:
                 and self._step > 0
             ):
                 n_resampled = self.sae.resample_dead_features(batch)
-                if n_resampled > 0:
-                    logger.info(
-                        "[step %d] Resampled %d dead features (%.2f%% of d_sae=%d)",
-                        self._step,
-                        n_resampled,
-                        100.0 * n_resampled / self.sae.cfg.d_sae,
-                        self.sae.cfg.d_sae,
-                    )
+                if self.is_main:
+                    if n_resampled > 0:
+                        logger.info(
+                            "[step %d] Resampled %d dead features (%.2f%% of d_sae=%d)",
+                            self._step,
+                            n_resampled,
+                            100.0 * n_resampled / self.sae.cfg.d_sae,
+                            self.sae.cfg.d_sae,
+                        )
+                    else:
+                        logger.info(
+                            "[step %d] Dead feature resampling check: 0 dead features found, nothing to resample",
+                            self._step,
+                        )
                     self.sae.feature_act_count.zero_()
                     self.sae.total_batches.zero_()
-                else:
-                    logger.info(
-                        "[step %d] Dead feature resampling check: 0 dead features found, nothing to resample",
-                        self._step,
-                    )
 
             # Checkpoint
             if (
                 self.cfg.checkpoint_dir
                 and self._tokens_seen % self.cfg.checkpoint_every < batch_tokens
             ):
-                ckpt_path = os.path.join(
-                    self.cfg.checkpoint_dir,
-                    f"sae_step{self._step}",
-                )
-                self.sae.save(ckpt_path)
-                logger.info(
-                    "[step %d] Checkpoint saved to: %s",
-                    self._step,
-                    ckpt_path,
-                )
+                if self.is_main:
+                    ckpt_path = os.path.join(
+                        self.cfg.checkpoint_dir,
+                        f"sae_step{self._step}",
+                    )
+                    self.sae.save(ckpt_path)
+                    logger.info(
+                        "[step %d] Checkpoint saved to: %s",
+                        self._step,
+                        ckpt_path,
+                    )
+                # All ranks wait until the checkpoint write is complete
+                if self.distributed:
+                    dist.barrier()
 
-        pbar.close()
+        if pbar is not None:
+            pbar.close()
 
         total_elapsed = time.time() - train_start
 
         # Final save
         if self.cfg.checkpoint_dir:
-            final_path = os.path.join(self.cfg.checkpoint_dir, "sae_final")
-            self.sae.save(final_path)
-            logger.info("Final model saved to: %s", final_path)
+            if self.is_main:
+                final_path = os.path.join(self.cfg.checkpoint_dir, "sae_final")
+                self.sae.save(final_path)
+                logger.info("Final model saved to: %s", final_path)
+            if self.distributed:
+                dist.barrier()
 
         self._log_final_summary(total_elapsed)
 

@@ -20,18 +20,31 @@ Usage:
         --hook_names layers_first.0.resid_post \
         --expansion_factor 32 \
         --checkpoint_dir ./checkpoints/saes
+
+    # Multi-GPU distributed training
+    torchrun --nproc_per_node=8 -m interp.scripts.train_saes \
+        --model_path /path/to/config \
+        --dataset_name <dataset> \
+        --hook_names layers_first.0.resid_post \
+        --checkpoint_dir ./checkpoints/saes
 """
 
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 
 import torch
 
 from interp.models.split_llama import SplitLlama, SplitLlamaConfig
 from interp.training.config import SAEConfig, TrainingConfig
-from interp.training.sae import SAETrainer, SparseAutoencoder
+from interp.training.sae import (
+    SAETrainer,
+    SparseAutoencoder,
+    cleanup_distributed,
+    setup_distributed,
+)
 from interp.wrapper.activation_store import ActivationStore
 from interp.wrapper.hooked_model import HookedSplitLlama
 
@@ -68,24 +81,48 @@ def parse_args():
     p.add_argument("--wandb_project", type=str, default="")
     p.add_argument("--seed", type=int, default=42)
 
+    # Distributed
+    p.add_argument("--distributed", action="store_true", help="Enable distributed training (auto-detected from LOCAL_RANK env var)")
+
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+
+    # Auto-detect distributed mode from environment (set by torchrun)
+    distributed = args.distributed or ("LOCAL_RANK" in os.environ)
+    rank = 0
+    local_rank = 0
+
+    if distributed:
+        rank, local_rank, _world_size = setup_distributed()
+        args.device = f"cuda:{local_rank}"
+
+    # Configure logging: INFO on rank 0, WARNING on other ranks
+    log_level = logging.INFO if rank == 0 else logging.WARNING
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+    )
+
     torch.manual_seed(args.seed)
 
-    if args.cache_dir:
-        # Train from cached activations
-        _train_from_cache(args)
-    elif args.model_path and args.dataset_name:
-        # Train from model + dataset
-        _train_from_model(args)
-    else:
-        raise ValueError(
-            "Provide either --cache_dir (cached activations) or "
-            "both --model_path and --dataset_name"
-        )
+    try:
+        if args.cache_dir:
+            # Train from cached activations
+            _train_from_cache(args)
+        elif args.model_path and args.dataset_name:
+            # Train from model + dataset
+            _train_from_model(args)
+        else:
+            raise ValueError(
+                "Provide either --cache_dir (cached activations) or "
+                "both --model_path and --dataset_name"
+            )
+    finally:
+        if distributed:
+            cleanup_distributed()
 
 
 def _train_from_cache(args):

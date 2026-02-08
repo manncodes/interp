@@ -74,3 +74,6 @@ class TrainingConfig:
 
     # Hook points to train on (list of hook names)
     hook_names: list[str] = field(default_factory=list)
+
+    # Distributed training (auto-detected when using torchrun, or set manually)
+    distributed: bool = False

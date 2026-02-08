@@ -27,18 +27,27 @@ Usage:
         --dataset_name dataset \
         --train_adapter \
         --checkpoint_dir ./checkpoints/transcoders
+
+    # Multi-GPU distributed training
+    torchrun --nproc_per_node=8 -m interp.scripts.train_transcoders \
+        --model_path /path/to/config \
+        --dataset_name <dataset> \
+        --layers layers_first.0 \
+        --checkpoint_dir ./checkpoints/transcoders
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 
 import torch
 
 from interp.models.split_llama import SplitLlama, SplitLlamaConfig
 from interp.training.config import TrainingConfig, TranscoderConfig
+from interp.training.sae import cleanup_distributed, setup_distributed
 from interp.training.transcoder import Transcoder, TranscoderTrainer
 from interp.wrapper.activation_store import ActivationStore
 from interp.wrapper.hooked_model import HookedSplitLlama
@@ -78,23 +87,47 @@ def parse_args():
     p.add_argument("--wandb_project", type=str, default="")
     p.add_argument("--seed", type=int, default=42)
 
+    # Distributed
+    p.add_argument("--distributed", action="store_true", help="Enable distributed training (auto-detected from LOCAL_RANK env var)")
+
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+
+    # Auto-detect distributed mode from environment (set by torchrun)
+    distributed = args.distributed or ("LOCAL_RANK" in os.environ)
+    rank = 0
+    local_rank = 0
+
+    if distributed:
+        rank, local_rank, _world_size = setup_distributed()
+        args.device = f"cuda:{local_rank}"
+
+    # Configure logging: INFO on rank 0, WARNING on other ranks
+    log_level = logging.INFO if rank == 0 else logging.WARNING
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+    )
+
     torch.manual_seed(args.seed)
 
     has_skip = not args.no_skip
 
-    if args.cache_dir:
-        _train_from_cache(args, has_skip)
-    elif args.model_path and args.dataset_name:
-        _train_from_model(args, has_skip)
-    else:
-        raise ValueError(
-            "Provide either --cache_dir or both --model_path and --dataset_name"
-        )
+    try:
+        if args.cache_dir:
+            _train_from_cache(args, has_skip)
+        elif args.model_path and args.dataset_name:
+            _train_from_model(args, has_skip)
+        else:
+            raise ValueError(
+                "Provide either --cache_dir or both --model_path and --dataset_name"
+            )
+    finally:
+        if distributed:
+            cleanup_distributed()
 
 
 def _get_mlp_pairs_for_layers(
