@@ -39,42 +39,48 @@ uv sync --all-extras
 
 ### 1. Train SAEs
 
-Train sparse autoencoders on residual stream activations:
-
 ```bash
-interp-train-saes \
+uv run interp-train-saes \
     --model_path /path/to/model_config \
-    --dataset_name togethercomputer/RedPajama-Data-1T-Sample \
+    --dataset_name HuggingFaceFW/fineweb-edu-sample-10BT \
     --hook_names layers_first.0.resid_post layers_last.0.resid_post \
-    --expansion_factor 32 \
-    --activation_fn topk \
-    --k 32 \
+    --expansion_factor 32 --activation_fn topk --k 32 \
     --total_tokens 100000000 \
     --checkpoint_dir ./checkpoints/saes
 ```
 
 ### 2. Train Transcoders
 
-Train skip transcoders that replace MLP layers with sparse, interpretable approximations:
-
 ```bash
-interp-train-transcoders \
+uv run interp-train-transcoders \
     --model_path /path/to/model_config \
-    --dataset_name togethercomputer/RedPajama-Data-1T-Sample \
-    --train_all \
-    --expansion_factor 32 \
-    --activation_fn topk \
-    --k 64 \
+    --dataset_name HuggingFaceFW/fineweb-edu-sample-10BT \
+    --train_all --expansion_factor 32 --activation_fn topk --k 64 \
     --total_tokens 200000000 \
     --checkpoint_dir ./checkpoints/transcoders
 ```
 
-### 3. Generate Attribution Graphs
+### 3. Multi-GPU Training
 
-Trace circuits through the model for a given prompt:
+Both trainers support distributed training via `torchrun`. Auto-detected from environment, no flags needed:
 
 ```bash
-interp-trace \
+torchrun --nproc_per_node=8 -m interp.scripts.train_saes \
+    --model_path /path/to/model_config \
+    --dataset_name HuggingFaceFW/fineweb-edu-sample-10BT \
+    --hook_names layers_first.0.resid_post \
+    --checkpoint_dir ./checkpoints/saes
+
+torchrun --nproc_per_node=8 -m interp.scripts.train_transcoders \
+    --model_path /path/to/model_config \
+    --dataset_name HuggingFaceFW/fineweb-edu-sample-10BT \
+    --train_all --checkpoint_dir ./checkpoints/transcoders
+```
+
+### 4. Generate Attribution Graphs
+
+```bash
+uv run interp-trace \
     --model_path /path/to/model_config \
     --transcoder_dir ./checkpoints/transcoders \
     --prompt "The capital of France is" \
