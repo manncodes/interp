@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "interp"
+version = "0.1.0"
+description = "Mechanistic interpretability framework for custom transformer architectures"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1.0",
+    "nnsight>=0.3.0",
+    "transformers>=4.40.0",
+    "safetensors>=0.4.0",
+    "datasets>=2.16.0",
+    "numpy>=1.24.0",
+    "tqdm>=4.65.0",
+]
+
+[project.optional-dependencies]
+train = [
+    "wandb>=0.16.0",
+    "bitsandbytes>=0.42.0",
+]
+deploy = [
+    "requests>=2.31.0",
+]
+all = [
+    "interp[train,deploy]",
+]
+
+[project.scripts]
+interp-train-saes = "interp.scripts.train_saes:main"
+interp-train-transcoders = "interp.scripts.train_transcoders:main"
+interp-trace = "interp.scripts.trace_circuits:main"
+
+[tool.setuptools.packages.find]
+include = ["interp*"]
