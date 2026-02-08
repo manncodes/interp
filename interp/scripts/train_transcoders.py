@@ -42,6 +42,9 @@ import argparse
 import json
 import logging
 import os
+import platform
+import sys
+import time
 
 import torch
 
@@ -51,6 +54,33 @@ from interp.training.sae import cleanup_distributed, setup_distributed
 from interp.training.transcoder import Transcoder, TranscoderTrainer
 from interp.wrapper.activation_store import ActivationStore
 from interp.wrapper.hooked_model import HookedSplitLlama
+
+logger = logging.getLogger("interp.scripts.train_transcoders")
+
+
+def _log_environment(distributed: bool, rank: int, world_size: int):
+    """Log system and environment info at startup."""
+    logger.info("=" * 72)
+    logger.info("ENVIRONMENT")
+    logger.info("=" * 72)
+    logger.info("  Python:        %s", sys.version.split()[0])
+    logger.info("  Platform:      %s", platform.platform())
+    logger.info("  PyTorch:       %s", torch.__version__)
+    logger.info("  CUDA available: %s", torch.cuda.is_available())
+    if torch.cuda.is_available():
+        logger.info("  CUDA version:  %s", torch.version.cuda)
+        logger.info("  GPU count:     %d", torch.cuda.device_count())
+        for i in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(i)
+            logger.info(
+                "  GPU %d:         %s (%.1f GB)",
+                i, props.name, props.total_mem / (1024 ** 3),
+            )
+    if distributed:
+        logger.info("  Distributed:   True (rank %d/%d)", rank, world_size)
+    else:
+        logger.info("  Distributed:   False")
+    logger.info("=" * 72)
 
 
 def parse_args():
@@ -83,6 +113,7 @@ def parse_args():
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--batch_size", type=int, default=4096)
     p.add_argument("--total_tokens", type=int, default=200_000_000)
+    p.add_argument("--log_every", type=int, default=100, help="Log metrics every N steps")
     p.add_argument("--checkpoint_dir", type=str, default="./checkpoints/transcoders")
     p.add_argument("--wandb_project", type=str, default="")
     p.add_argument("--seed", type=int, default=42)
@@ -100,9 +131,10 @@ def main():
     distributed = args.distributed or ("LOCAL_RANK" in os.environ)
     rank = 0
     local_rank = 0
+    world_size = 1
 
     if distributed:
-        rank, local_rank, _world_size = setup_distributed()
+        rank, local_rank, world_size = setup_distributed()
         args.device = f"cuda:{local_rank}"
 
     # Configure logging: INFO on rank 0, WARNING on other ranks
@@ -110,11 +142,16 @@ def main():
     logging.basicConfig(
         level=log_level,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+        force=True,
     )
 
     torch.manual_seed(args.seed)
 
     has_skip = not args.no_skip
+
+    if rank == 0:
+        _log_environment(distributed, rank, world_size)
+        logger.info("CLI args: %s", vars(args))
 
     try:
         if args.cache_dir:
@@ -146,6 +183,7 @@ def _get_mlp_pairs_for_layers(
 def _train_from_cache(args, has_skip: bool):
     from pathlib import Path
 
+    logger.info("Loading cached activations from: %s", args.cache_dir)
     with open(Path(args.cache_dir) / "meta.json") as f:
         meta = json.load(f)
 
@@ -153,21 +191,36 @@ def _train_from_cache(args, has_skip: bool):
     hook_names = meta["hook_names"]
     mlp_in_hooks = [h for h in hook_names if h.endswith(".mlp_in")]
 
+    logger.info("Cache metadata:")
+    logger.info("  hooks: %s", hook_names)
+    logger.info("  dims:  %s", meta["dims"])
+    logger.info("  MLP input hooks found: %d", len(mlp_in_hooks))
+
+    trained_count = 0
     for mlp_in_hook in mlp_in_hooks:
         mlp_out_hook = mlp_in_hook.replace(".mlp_in", ".mlp_out")
         layer_key = mlp_in_hook.rsplit(".mlp_in", 1)[0]
 
         if args.layers and layer_key not in args.layers:
+            logger.info("Skipping %s (not in --layers filter)", layer_key)
             continue
 
         if mlp_out_hook not in hook_names:
-            print(f"Skipping {layer_key}: mlp_out not cached")
+            logger.warning("Skipping %s: mlp_out not cached", layer_key)
             continue
 
         d_in = meta["dims"][mlp_in_hook]
         d_out = meta["dims"][mlp_out_hook]
 
-        print(f"\n--- Training transcoder for {layer_key} (d_in={d_in}, d_out={d_out}) ---")
+        trained_count += 1
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info("Training transcoder for: %s", layer_key)
+        logger.info("=" * 60)
+        logger.info("  d_in = %d, d_out = %d", d_in, d_out)
+        logger.info("  d_hidden = %d (expansion_factor=%d)", d_in * args.expansion_factor, args.expansion_factor)
+        logger.info("  activation_fn = %s (k=%d)", args.activation_fn, args.k)
+        logger.info("  has_skip = %s", has_skip)
 
         tc_cfg = TranscoderConfig(
             d_in=d_in,
@@ -182,6 +235,7 @@ def _train_from_cache(args, has_skip: bool):
             lr=args.lr,
             batch_size=args.batch_size,
             total_tokens=args.total_tokens,
+            log_every=args.log_every,
             checkpoint_dir=os.path.join(args.checkpoint_dir, layer_key.replace(".", "_")),
             wandb_project=args.wandb_project,
             wandb_run_name=f"tc_{layer_key}",
@@ -209,31 +263,53 @@ def _train_from_cache(args, has_skip: bool):
 
         trainer.train(make_loader())
 
+    logger.info("All %d transcoder(s) trained.", trained_count)
+
 
 def _train_from_model(args, has_skip: bool):
     from datasets import load_dataset
     from transformers import AutoTokenizer
 
+    # Load model
+    logger.info("Loading model from: %s", args.model_path)
+    t0 = time.time()
     config = SplitLlamaConfig(model_path=args.model_path, context_len=args.context_len)
     model = SplitLlama(config)
     hooked = HookedSplitLlama(model, device=args.device)
+    logger.info("Model loaded in %.1fs", time.time() - t0)
+    logger.info("  device: %s", args.device)
+    logger.info("  context_len: %d", args.context_len)
+    logger.info("  d_model_first: %d", hooked.topology.d_model_first)
+    logger.info("  d_model_last: %d", hooked.topology.d_model_last)
 
     # Get MLP pairs to train
     if args.train_all:
         pairs = _get_mlp_pairs_for_layers(hooked, [])
+        logger.info("--train_all: training all %d MLP layers", len(pairs))
     elif args.layers:
         pairs = _get_mlp_pairs_for_layers(hooked, args.layers)
+        logger.info("Training %d selected MLP layers: %s", len(pairs), args.layers)
     else:
         pairs = _get_mlp_pairs_for_layers(hooked, [])
+        logger.info("No layer filter: training all %d MLP layers", len(pairs))
+
+    for layer_key, mlp_in, mlp_out in pairs:
+        logger.info("  %s: %s -> %s", layer_key, mlp_in, mlp_out)
 
     # Load dataset
+    logger.info("Loading dataset: %s (split=%s, streaming=True)", args.dataset_name, args.dataset_split)
+    t0 = time.time()
     dataset = load_dataset(args.dataset_name, split=args.dataset_split, streaming=True)
+    logger.info("Dataset loaded in %.1fs", time.time() - t0)
 
+    # Load tokenizer
+    logger.info("Loading tokenizer from model config...")
     with open(os.path.join(args.model_path, "config.json")) as f:
         model_cfg = json.load(f)
     tokenizer = AutoTokenizer.from_pretrained(model_cfg["path8b"])
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    logger.info("Tokenizer loaded: %s (vocab_size=%d)", type(tokenizer).__name__, tokenizer.vocab_size)
 
     def tokenize_iter():
         for example in dataset:
@@ -247,11 +323,19 @@ def _train_from_model(args, has_skip: bool):
             )
             yield encoded["input_ids"].squeeze(0)
 
-    for layer_key, mlp_in_hook, mlp_out_hook in pairs:
-        print(f"\n--- Training transcoder for {layer_key} ---")
-
+    for i, (layer_key, mlp_in_hook, mlp_out_hook) in enumerate(pairs):
         d_in = hooked.get_d_model(mlp_in_hook)
         d_out = hooked.get_d_model(mlp_out_hook)
+
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info("Training transcoder %d/%d: %s", i + 1, len(pairs), layer_key)
+        logger.info("=" * 60)
+        logger.info("  mlp_in hook:  %s (d=%d)", mlp_in_hook, d_in)
+        logger.info("  mlp_out hook: %s (d=%d)", mlp_out_hook, d_out)
+        logger.info("  d_hidden = %d (expansion_factor=%d)", d_in * args.expansion_factor, args.expansion_factor)
+        logger.info("  activation_fn = %s (k=%d)", args.activation_fn, args.k)
+        logger.info("  has_skip = %s", has_skip)
 
         tc_cfg = TranscoderConfig(
             d_in=d_in,
@@ -266,6 +350,7 @@ def _train_from_model(args, has_skip: bool):
             lr=args.lr,
             batch_size=args.batch_size,
             total_tokens=args.total_tokens,
+            log_every=args.log_every,
             checkpoint_dir=os.path.join(args.checkpoint_dir, layer_key.replace(".", "_")),
             wandb_project=args.wandb_project,
             wandb_run_name=f"tc_{layer_key}",
@@ -293,6 +378,8 @@ def _train_from_model(args, has_skip: bool):
                     )
 
         trainer.train(make_paired_iter())
+
+    logger.info("All %d transcoder(s) trained.", len(pairs))
 
 
 if __name__ == "__main__":

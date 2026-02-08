@@ -51,7 +51,7 @@ class TrainingConfig:
     total_tokens: int = 100_000_000  # 100M tokens
     warmup_tokens: int = 1_000_000
     checkpoint_every: int = 10_000_000
-    log_every: int = 1000
+    log_every: int = 100
     l1_coeff: float = 1e-3  # only used for relu activation
     dead_feature_window: int = 5000
     dead_feature_threshold: float = 1e-8

@@ -32,8 +32,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
+import platform
+import sys
+import time
 
 import torch
 
@@ -47,6 +51,33 @@ from interp.training.sae import (
 )
 from interp.wrapper.activation_store import ActivationStore
 from interp.wrapper.hooked_model import HookedSplitLlama
+
+logger = logging.getLogger("interp.scripts.train_saes")
+
+
+def _log_environment(distributed: bool, rank: int, world_size: int):
+    """Log system and environment info at startup."""
+    logger.info("=" * 72)
+    logger.info("ENVIRONMENT")
+    logger.info("=" * 72)
+    logger.info("  Python:        %s", sys.version.split()[0])
+    logger.info("  Platform:      %s", platform.platform())
+    logger.info("  PyTorch:       %s", torch.__version__)
+    logger.info("  CUDA available: %s", torch.cuda.is_available())
+    if torch.cuda.is_available():
+        logger.info("  CUDA version:  %s", torch.version.cuda)
+        logger.info("  GPU count:     %d", torch.cuda.device_count())
+        for i in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(i)
+            logger.info(
+                "  GPU %d:         %s (%.1f GB)",
+                i, props.name, props.total_mem / (1024 ** 3),
+            )
+    if distributed:
+        logger.info("  Distributed:   True (rank %d/%d)", rank, world_size)
+    else:
+        logger.info("  Distributed:   False")
+    logger.info("=" * 72)
 
 
 def parse_args():
@@ -77,6 +108,7 @@ def parse_args():
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--batch_size", type=int, default=4096)
     p.add_argument("--total_tokens", type=int, default=100_000_000)
+    p.add_argument("--log_every", type=int, default=100, help="Log metrics every N steps")
     p.add_argument("--checkpoint_dir", type=str, default="./checkpoints/saes")
     p.add_argument("--wandb_project", type=str, default="")
     p.add_argument("--seed", type=int, default=42)
@@ -94,9 +126,10 @@ def main():
     distributed = args.distributed or ("LOCAL_RANK" in os.environ)
     rank = 0
     local_rank = 0
+    world_size = 1
 
     if distributed:
-        rank, local_rank, _world_size = setup_distributed()
+        rank, local_rank, world_size = setup_distributed()
         args.device = f"cuda:{local_rank}"
 
     # Configure logging: INFO on rank 0, WARNING on other ranks
@@ -104,16 +137,19 @@ def main():
     logging.basicConfig(
         level=log_level,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+        force=True,
     )
 
     torch.manual_seed(args.seed)
 
+    if rank == 0:
+        _log_environment(distributed, rank, world_size)
+        logger.info("CLI args: %s", vars(args))
+
     try:
         if args.cache_dir:
-            # Train from cached activations
             _train_from_cache(args)
         elif args.model_path and args.dataset_name:
-            # Train from model + dataset
             _train_from_model(args)
         else:
             raise ValueError(
@@ -127,16 +163,25 @@ def main():
 
 def _train_from_cache(args):
     """Train SAEs from pre-cached activations."""
-    for hook_name in args.hook_names:
-        print(f"\n--- Training SAE for {hook_name} ---")
+    from pathlib import Path
 
-        # Determine d_in from cached metadata
-        import json
-        from pathlib import Path
-        with open(Path(args.cache_dir) / "meta.json") as f:
-            meta = json.load(f)
+    logger.info("Loading cached activations from: %s", args.cache_dir)
+    with open(Path(args.cache_dir) / "meta.json") as f:
+        meta = json.load(f)
+
+    logger.info("Cache metadata:")
+    logger.info("  hooks: %s", meta["hook_names"])
+    logger.info("  dims:  %s", meta["dims"])
+    logger.info("  total_tokens: %s", meta.get("total_tokens", "unknown"))
+
+    for hook_name in args.hook_names:
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info("Training SAE for hook: %s", hook_name)
+        logger.info("=" * 60)
 
         d_in = meta["dims"][hook_name]
+        logger.info("  d_in = %d", d_in)
 
         sae_cfg = SAEConfig(
             d_in=d_in,
@@ -149,6 +194,7 @@ def _train_from_cache(args):
             lr=args.lr,
             batch_size=args.batch_size,
             total_tokens=args.total_tokens,
+            log_every=args.log_every,
             checkpoint_dir=os.path.join(args.checkpoint_dir, hook_name.replace(".", "_")),
             wandb_project=args.wandb_project,
             wandb_run_name=f"sae_{hook_name}",
@@ -159,7 +205,6 @@ def _train_from_cache(args):
         sae = SparseAutoencoder(sae_cfg)
         trainer = SAETrainer(sae, train_cfg)
 
-        # Create a multi-epoch loader
         def make_loader():
             tokens_yielded = 0
             while tokens_yielded < args.total_tokens:
@@ -183,25 +228,39 @@ def _train_from_model(args):
     from transformers import AutoTokenizer
 
     # Load model
+    logger.info("Loading model from: %s", args.model_path)
+    t0 = time.time()
     config = SplitLlamaConfig(model_path=args.model_path, context_len=args.context_len)
     model = SplitLlama(config)
     hooked = HookedSplitLlama(model, device=args.device)
+    logger.info("Model loaded in %.1fs", time.time() - t0)
+    logger.info("  device: %s", args.device)
+    logger.info("  context_len: %d", args.context_len)
+    logger.info("  d_model_first: %d", hooked.topology.d_model_first)
+    logger.info("  d_model_last: %d", hooked.topology.d_model_last)
+    logger.info("  total resid hooks: %d", len(hooked.topology.all_resid_hooks))
 
     # Resolve hook names
     hook_names = args.hook_names
     if args.train_all_resid:
         hook_names = hooked.topology.all_resid_hooks
+        logger.info("--train_all_resid: resolved to %d hooks", len(hook_names))
+    logger.info("Hooks to train: %s", hook_names)
 
     # Load dataset
+    logger.info("Loading dataset: %s (split=%s, streaming=True)", args.dataset_name, args.dataset_split)
+    t0 = time.time()
     dataset = load_dataset(args.dataset_name, split=args.dataset_split, streaming=True)
+    logger.info("Dataset loaded in %.1fs", time.time() - t0)
 
     # Detect tokenizer from model path
-    import json
+    logger.info("Loading tokenizer from model config...")
     with open(os.path.join(args.model_path, "config.json")) as f:
         model_cfg = json.load(f)
     tokenizer = AutoTokenizer.from_pretrained(model_cfg["path8b"])
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    logger.info("Tokenizer loaded: %s (vocab_size=%d)", type(tokenizer).__name__, tokenizer.vocab_size)
 
     # Tokenize dataset
     def tokenize_iter():
@@ -217,10 +276,16 @@ def _train_from_model(args):
             yield encoded["input_ids"].squeeze(0)
 
     # Train SAE for each hook
-    for hook_name in hook_names:
-        print(f"\n--- Training SAE for {hook_name} ---")
+    for i, hook_name in enumerate(hook_names):
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info("Training SAE %d/%d: %s", i + 1, len(hook_names), hook_name)
+        logger.info("=" * 60)
 
         d_in = hooked.get_d_model(hook_name)
+        logger.info("  d_in = %d", d_in)
+        logger.info("  d_sae = %d (expansion_factor=%d)", d_in * args.expansion_factor, args.expansion_factor)
+        logger.info("  activation_fn = %s (k=%d)", args.activation_fn, args.k)
 
         sae_cfg = SAEConfig(
             d_in=d_in,
@@ -233,6 +298,7 @@ def _train_from_model(args):
             lr=args.lr,
             batch_size=args.batch_size,
             total_tokens=args.total_tokens,
+            log_every=args.log_every,
             checkpoint_dir=os.path.join(args.checkpoint_dir, hook_name.replace(".", "_")),
             wandb_project=args.wandb_project,
             wandb_run_name=f"sae_{hook_name}",
@@ -254,6 +320,8 @@ def _train_from_model(args):
                     yield acts[i : i + args.batch_size]
 
         trainer.train(make_activation_iter())
+
+    logger.info("All %d SAE(s) trained.", len(hook_names))
 
 
 if __name__ == "__main__":
